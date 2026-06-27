@@ -106,7 +106,6 @@ def reset_app_state():
 # UI configurations
 uploaded_file = st.file_uploader("📁 Upload Infor LN Trace File (.txt, .log, .gz)", type=["txt", "log", "gz"])
 
-# Create buttons variables
 click_scan = False
 click_clear = False
 
@@ -123,7 +122,6 @@ if uploaded_file is not None:
         reset_app_state()
         st.rerun()
 
-    # CRITICAL COUPLING FIX: This code block now runs outside of the column context
     if click_scan or st.session_state.processed:
         if not st.session_state.processed:
             with st.spinner("Streaming trace contents into background container blocks..."):
@@ -149,8 +147,12 @@ if uploaded_file is not None:
                 tab1, tab2 = st.tabs(["🔍 Interactive Data Browser Grid", "📊 Aggregated Table Analysis Summary"])
                 
                 with tab1:
-                    st.subheader("Raw Performance Trace Stream")
-                    st.dataframe(df_results[["FunctionName", "TableName", "Duration_MS", "ExecutingObject"]].head(10000), use_container_width=True)
+                    st.subheader("Raw Performance Trace Stream (Sorted by Slowest)")
+                    
+                    # CRITICAL FIX: Sort the primary dataframe in descending order by Duration_MS
+                    sorted_df = df_results.sort_values(by="Duration_MS", ascending=False)
+                    
+                    st.dataframe(sorted_df[["FunctionName", "TableName", "Duration_MS", "ExecutingObject"]].head(10000), use_container_width=True)
                     
                 with tab2:
                     st.subheader("Loop & Frequency Bottleneck Matrix")
