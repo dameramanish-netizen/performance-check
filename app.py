@@ -7,10 +7,11 @@ from datetime import datetime
 st.set_page_config(page_title="Infor LN Performance Dashboard", layout="wide")
 
 st.title("⚡ Infor LN Deep Performance Analyzer")
-st.markdown("Cloud-hosted standalone trace analysis tracking your custom script logic boundaries.")
+st.markdown("Cloud-hosted standalone trace analysis. Outputs are cached in memory to prevent repetitive scans.")
 
-# --- PARSING ENGINE MATCHING YOUR POWERSHELL SCHEMA ---
-def parse_trace_powershell_logic(uploaded_file, min_duration_ms):
+# --- CACHED PARSING FUNCTION (Locks the scan in background memory) ---
+@st.cache_data(show_spinner=False)
+def parse_trace_powershell_logic(file_bytes, file_name, min_duration_ms):
     stack = []  
     slow_calls = []
     line_count = 0
@@ -20,18 +21,15 @@ def parse_trace_powershell_logic(uploaded_file, min_duration_ms):
     exit_pattern = re.compile(r'\[(\d{2}:\d{2}:\d{2}\.\d{3})\].*?<<--\s+\(depth\s+\d+\):\s+(.*)')
     table_pattern = re.compile(r'"([^"]+)"')
 
-    # Detect if file object is compressed Gzip or raw text
-    is_gzip = uploaded_file.name.endswith('.gz')
-    f = gzip.open(uploaded_file, mode='rt', encoding='utf-8', errors='ignore') if is_gzip else uploaded_file
+    # Re-open stream safely from the raw binary cache block
+    if file_name.endswith('.gz'):
+        f = gzip.open(file_bytes, mode='rt', encoding='utf-8', errors='ignore')
+    else:
+        # Wrap raw bytes back to string decoder wrapper lines
+        f = [line.decode('utf-8', errors='ignore') for line in file_bytes.readlines()]
 
-    progress_text = st.empty()
-
-    # Stream line by line safely from memory buffers
     for line in f:
         line_count += 1
-        if line_count % 2000000 == 0:
-            progress_text.text(f"⏳ Scanned {line_count / 10000000:.2f} Crore lines...")
-
         clean_line = line.strip()
 
         # 1. Match Entry Block (-->>)
@@ -72,7 +70,7 @@ def parse_trace_powershell_logic(uploaded_file, min_duration_ms):
                     duration_ms = (end_time - pop_info["Start"]).total_seconds() * 1000
                     
                     if duration_ms < 0:
-                        duration_ms += 86400000  # Midnight wrap safety
+                        duration_ms += 86400000  # Midnight safety wrap
                     
                     if duration_ms > min_duration_ms:
                         slow_calls.append({
@@ -85,42 +83,76 @@ def parse_trace_powershell_logic(uploaded_file, min_duration_ms):
                 except ValueError:
                     pass
 
-    progress_text.empty()
     return pd.DataFrame(slow_calls), line_count
 
-# --- CLOUD-SAFE UI LOGIC INTERFACE ---
+# --- INITIALIZE SESSION TRACKING STATE NODES ---
+if 'processed' not in st.session_state:
+    st.session_state.processed = False
+if 'df_results' not in st.session_state:
+    st.session_state.df_results = None
+if 'total_scanned' not in st.session_state:
+    st.session_state.total_scanned = 0
+
+# --- TRACK CLEAR SELECTION WORKFLOWS ---
+def reset_app_state():
+    st.cache_data.clear()  # Wipes the memory cache completely
+    st.session_state.processed = False
+    st.session_state.df_results = None
+    st.session_state.total_scanned = 0
+
+# Layout configurations
 uploaded_file = st.file_uploader("📁 Upload Infor LN Trace File (.txt, .log, .gz)", type=["txt", "log", "gz"])
+
+col_scan, col_clear, _ = st.columns([1, 1, 4])
+
+with col_clear:
+    if st.button("🗑️ Reset and Clear Data", type="secondary", use_container_width=True, on_click=reset_app_state):
+        st.rerun()
 
 if uploaded_file is not None:
     threshold = st.slider("🎯 Filter out fast calls slower than (ms):", min_value=0, max_value=500, value=10)
     
-    with st.spinner("Processing text streams through background cloud node containers..."):
-        df_results, total_scanned = parse_trace_powershell_logic(uploaded_file, threshold)
-        
-    if total_scanned == 0:
-        st.error("No compatible lines parsed. Check formatting.")
-    else:
-        st.subheader("📋 Performance Profile Summary")
-        k1, k2 = st.columns(2)
-        k1.metric("Total Lines Scanned", f"{total_scanned / 10000000:.2f} Crore")
-        k2.metric(f"Slow Calls Captured (>{threshold}ms)", f"{len(df_results):,}")
-        
-        st.markdown("---")
-        
-        if not df_results.empty:
-            tab1, tab2 = st.tabs(["🔍 Interactive Data Browser Grid", "📊 Aggregated Table Analysis Summary"])
+    with col_scan:
+        # User explicitly triggers the execution loop scan action
+        if st.button("🚀 Analyze Log Trace", type="primary", use_container_width=True) or st.session_state.processed:
             
-            with tab1:
-                st.subheader("Raw Performance Trace Stream")
-                st.dataframe(df_results[["FunctionName", "TableName", "Duration_MS", "ExecutingObject"]].head(10000), use_container_width=True)
+            # If this specific file context hasn't been scanned yet, read it once
+            if not st.session_state.processed:
+                with st.spinner("Streaming trace contents and initializing caching matrices..."):
+                    df_res, scanned = parse_trace_powershell_logic(uploaded_file, uploaded_file.name, threshold)
+                    st.session_state.df_results = df_res
+                    st.session_state.total_scanned = scanned
+                    st.session_state.processed = True
+            
+            df_results = st.session_state.df_results
+            total_scanned = st.session_state.total_scanned
+
+            if total_scanned == 0:
+                st.error("No compatible lines parsed. Check formatting.")
+            else:
+                st.subheader("📋 Performance Profile Summary")
+                k1, k2 = st.columns(2)
+                k1.metric("Total Lines Scanned", f"{total_scanned:,}")
+                k2.metric(f"Slow Calls Captured (>{threshold}ms)", f"{len(df_results):,}")
                 
-            with tab2:
-                st.subheader("Loop & Frequency Bottleneck Matrix")
-                agg_df = df_results.groupby(["FunctionName", "TableName"]).agg(
-                    Executions=("Duration_MS", "count"),
-                    Total_Duration_MS=("Duration_MS", "sum")
-                ).reset_index().sort_values(by="Total_Duration_MS", ascending=False)
+                st.markdown("---")
                 
-                st.dataframe(agg_df, use_container_width=True)
-        else:
-            st.success("Analysis complete. No slow operations detected past your filter conditions.")
+                if not df_results.empty:
+                    tab1, tab2 = st.tabs(["🔍 Interactive Data Browser Grid", "📊 Aggregated Table Analysis Summary"])
+                    
+                    with tab1:
+                        st.subheader("Raw Performance Trace Stream")
+                        st.dataframe(df_results[["FunctionName", "TableName", "Duration_MS", "ExecutingObject"]].head(10000), use_container_width=True)
+                        
+                    with tab2:
+                        st.subheader("Loop & Frequency Bottleneck Matrix")
+                        agg_df = df_results.groupby(["FunctionName", "TableName"]).agg(
+                            Executions=("Duration_MS", "count"),
+                            Total_Duration_MS=("Duration_MS", "sum")
+                        ).reset_index().sort_values(by="Total_Duration_MS", ascending=False)
+                        
+                        st.dataframe(agg_df, use_container_width=True)
+                else:
+                    st.success("Analysis complete. No slow operations detected past your filter conditions.")
+else:
+    reset_app_state()
