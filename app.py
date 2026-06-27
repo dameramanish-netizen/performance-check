@@ -2,14 +2,15 @@ import streamlit as st
 import re
 import pandas as pd
 import gzip
+import io
 from datetime import datetime
 
 st.set_page_config(page_title="Infor LN Performance Dashboard", layout="wide")
 
 st.title("⚡ Infor LN Deep Performance Analyzer")
-st.markdown("Cloud-hosted standalone trace analysis. Outputs are cached in memory to prevent repetitive scans.")
+st.markdown("Cloud-hosted standalone trace analysis. Streaming lines via low-memory chunk structures.")
 
-# --- CACHED PARSING FUNCTION (Locks the scan in background memory) ---
+# --- CACHED PARSING FUNCTION (Low-Memory Stream Optimization) ---
 @st.cache_data(show_spinner=False)
 def parse_trace_powershell_logic(file_bytes, file_name, min_duration_ms):
     stack = []  
@@ -21,67 +22,72 @@ def parse_trace_powershell_logic(file_bytes, file_name, min_duration_ms):
     exit_pattern = re.compile(r'\[(\d{2}:\d{2}:\d{2}\.\d{3})\].*?<<--\s+\(depth\s+\d+\):\s+(.*)')
     table_pattern = re.compile(r'"([^"]+)"')
 
-    # Re-open stream safely from the raw binary cache block
+    # Stream line by line using an memory-optimized wrapper stream
     if file_name.endswith('.gz'):
         f = gzip.open(file_bytes, mode='rt', encoding='utf-8', errors='ignore')
     else:
-        # Wrap raw bytes back to string decoder wrapper lines
-        f = [line.decode('utf-8', errors='ignore') for line in file_bytes.readlines()]
+        # Crucial Fix: Wraps binary data object safely into an on-demand generator text reader line by line
+        f = io.TextIOWrapper(file_bytes, encoding='utf-8', errors='ignore')
 
-    for line in f:
-        line_count += 1
-        clean_line = line.strip()
+    try:
+        for line in f:
+            line_count += 1
+            clean_line = line.strip()
 
-        # 1. Match Entry Block (-->>)
-        entry_match = entry_pattern.search(clean_line)
-        if entry_match:
-            time_part, func_name, params, obj_name = entry_match.groups()
-            
-            table_name = "N/A"
-            table_match = table_pattern.search(params)
-            if table_match and table_match.group(1).strip():
-                table_name = table_match.group(1).strip()
-            elif "whinh" in params or "ttadv" in params:
-                words = re.findall(r'[a-z]{5}\d{3}', params)
-                if words: table_name = words[0]
-            
-            try:
-                start_time = datetime.strptime(time_part, "%H:%M:%S.%f")
-                stack.append({
-                    "Name": func_name.strip(),
-                    "Table": table_name,
-                    "Start": start_time,
-                    "Object": obj_name.strip(),
-                    "StartTimeStr": time_part
-                })
-            except ValueError:
-                pass
-            continue
-
-        # 2. Match Exit Block (<<--)
-        exit_match = exit_pattern.search(clean_line)
-        if exit_match:
-            if stack:  
-                time_part = exit_match.group(1)
-                pop_info = stack.pop()
+            # 1. Match Entry Block (-->>)
+            entry_match = entry_pattern.search(clean_line)
+            if entry_match:
+                time_part, func_name, params, obj_name = entry_match.groups()
+                
+                table_name = "N/A"
+                table_match = table_pattern.search(params)
+                if table_match and table_match.group(1).strip():
+                    table_name = table_match.group(1).strip()
+                elif "whinh" in params or "ttadv" in params:
+                    words = re.findall(r'[a-z]{5}\d{3}', params)
+                    if words: table_name = words[0]
                 
                 try:
-                    end_time = datetime.strptime(time_part, "%H:%M:%S.%f")
-                    duration_ms = (end_time - pop_info["Start"]).total_seconds() * 1000
-                    
-                    if duration_ms < 0:
-                        duration_ms += 86400000  # Midnight safety wrap
-                    
-                    if duration_ms > min_duration_ms:
-                        slow_calls.append({
-                            "Line": line_count,
-                            "FunctionName": pop_info["Name"],
-                            "TableName": pop_info["Table"],
-                            "Duration_MS": round(duration_ms, 2),
-                            "ExecutingObject": pop_info["Object"]
-                        })
+                    start_time = datetime.strptime(time_part, "%H:%M:%S.%f")
+                    stack.append({
+                        "Name": func_name.strip(),
+                        "Table": table_name,
+                        "Start": start_time,
+                        "Object": obj_name.strip(),
+                        "StartTimeStr": time_part
+                    })
                 except ValueError:
                     pass
+                continue
+
+            # 2. Match Exit Block (<<--)
+            exit_match = exit_pattern.search(clean_line)
+            if exit_match:
+                if stack:  
+                    time_part = exit_match.group(1)
+                    pop_info = stack.pop()
+                    
+                    try:
+                        end_time = datetime.strptime(time_part, "%H:%M:%S.%f")
+                        duration_ms = (end_time - pop_info["Start"]).total_seconds() * 1000
+                        
+                        if duration_ms < 0:
+                            duration_ms += 86400000  # Midnight safety wrap
+                        
+                        if duration_ms > min_duration_ms:
+                            slow_calls.append({
+                                "Line": line_count,
+                                "FunctionName": pop_info["Name"],
+                                "TableName": pop_info["Table"],
+                                "Duration_MS": round(duration_ms, 2),
+                                "ExecutingObject": pop_info["Object"]
+                            })
+                    except ValueError:
+                        pass
+    finally:
+        # Always safeguard resources by closing streams when calculations exit
+        if not file_name.endswith('.gz'):
+            f.detach()
 
     return pd.DataFrame(slow_calls), line_count
 
@@ -93,14 +99,13 @@ if 'df_results' not in st.session_state:
 if 'total_scanned' not in st.session_state:
     st.session_state.total_scanned = 0
 
-# --- TRACK CLEAR SELECTION WORKFLOWS ---
 def reset_app_state():
-    st.cache_data.clear()  # Wipes the memory cache completely
+    st.cache_data.clear()  
     st.session_state.processed = False
     st.session_state.df_results = None
     st.session_state.total_scanned = 0
 
-# Layout configurations
+# UI configurations
 uploaded_file = st.file_uploader("📁 Upload Infor LN Trace File (.txt, .log, .gz)", type=["txt", "log", "gz"])
 
 col_scan, col_clear, _ = st.columns([1, 1, 4])
@@ -113,12 +118,10 @@ if uploaded_file is not None:
     threshold = st.slider("🎯 Filter out fast calls slower than (ms):", min_value=0, max_value=500, value=10)
     
     with col_scan:
-        # User explicitly triggers the execution loop scan action
         if st.button("🚀 Analyze Log Trace", type="primary", use_container_width=True) or st.session_state.processed:
             
-            # If this specific file context hasn't been scanned yet, read it once
             if not st.session_state.processed:
-                with st.spinner("Streaming trace contents and initializing caching matrices..."):
+                with st.spinner("Streaming trace contents into background container blocks..."):
                     df_res, scanned = parse_trace_powershell_logic(uploaded_file, uploaded_file.name, threshold)
                     st.session_state.df_results = df_res
                     st.session_state.total_scanned = scanned
